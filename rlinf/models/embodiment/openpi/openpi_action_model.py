@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""OpenPI (Pi0/Pi0.5) 强化学习动作预测模型。
+
+本模块在 openpi 的 PI0Pytorch 基础上扩展，支持以下强化学习能力：
+- 多种流匹配噪声方法（flow_ode / flow_sde / flow_noise / flow_cps）
+- 价值头（Value Head）用于 PPO 等 Actor-Critic 算法
+- DSRL（Diffusion-based SAC）模块，独立编码器 + 高斯策略 + 多 Q 头
+- NFT（Noise Flow Training）状态采集
+- RLT（RL Token）轻量 Transformer 前缀
+"""
+
 import math
 import random
 from collections.abc import Sequence
@@ -37,11 +47,18 @@ from rlinf.utils.pytree import register_pytree_dataclasses
 
 
 def _to_numpy(x):
+    """将 torch.Tensor 转为 numpy.ndarray，非张量原样返回。"""
     return np.asarray(x.detach().cpu()) if torch.is_tensor(x) else x
 
 
 @dataclass(frozen=True)
 class OpenPi0Config(Pi0Config):
+    """OpenPI 强化学习配置类，继承自 openpi 的 Pi0Config。
+
+    在原始 Pi0 配置基础上增加了 RL 训练所需的噪声方法、价值头、
+    DSRL、NFT、RLT 等模块的配置参数。
+    """
+
     # config for rl
     config_name: str = "pi0_libero"  # pi0_libero, pi05_libero, pi0_maniskill, pi05_maniskill, pi0_metaworld, pi05_metaworld
     num_images_in_input: int = 2  # number of images in input
@@ -106,6 +123,10 @@ class OpenPi0Config(Pi0Config):
 class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     """
     Pi0 model for reinforcement learning action prediction.
+
+    本类同时继承 PI0Pytorch（openpi 原始实现）和 BasePolicy（RLinf 基础策略接口），
+    在流匹配去噪框架上扩展了 RL 训练所需的日志概率计算、价值估计、
+    多种噪声注入策略，以及 DSRL/NFT/RLT 等可选模块。
     """
 
     config: OpenPi0Config
@@ -280,6 +301,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self.torch_compile_enabled = False
 
     def set_global_step(self, global_step):
+        """设置全局训练步数，用于噪声退火等需要按步数调整的逻辑。"""
         self.global_step = global_step
 
     def setup_wrappers(
@@ -287,10 +309,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         transforms: Sequence[_transforms.DataTransformFn] = (),
         output_transforms: Sequence[_transforms.DataTransformFn] = (),
     ):
+        """设置输入/输出的数据变换管线（openpi DataTransformFn）。"""
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
 
     def input_transform(self, obs: dict, transpose=True):
+        """将环境观测字典转换为模型输入格式。
+
+        处理流程：拆分 batch -> 逐样本执行 openpi input_transform -> 重新合并为 batch 张量。
+        若 obs 中已包含 tokenized_prompt（非首次处理），则直接透传。
+        """
         inputs = tree_map(lambda x: x, obs)
         # process input
         first_process = "prompt" in inputs.keys()
@@ -336,6 +364,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return inputs
 
     def output_transform(self, outputs):
+        """将模型原始输出转换为环境可执行的动作格式。
+
+        处理流程：拆分 batch -> 逐样本执行 openpi output_transform -> 重新合并 -> 截取 action_chunk 长度。
+        """
         # split & transform
         batch_size = outputs["actions"].shape[0]
         transformed_samples = []
@@ -352,6 +384,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return outputs
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
+        """统一前向入口，根据 forward_type 分发到不同的前向方法。
+
+        - SFT: 监督微调前向
+        - DEFAULT: RL 默认前向（计算 logprob/value/entropy）
+        - NFT: Noise Flow Training 前向
+        - SAC / SAC_Q: DSRL 的 SAC 策略/Q 值前向
+        """
         if forward_type == ForwardType.SFT:
             return self.sft_forward(**kwargs)
         elif forward_type == ForwardType.DEFAULT:
@@ -366,6 +405,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             raise NotImplementedError
 
     def sft_forward(self, data, use_action_chunk_loss: bool = False, **kwargs):
+        """SFT（监督微调）前向，计算流匹配 MSE 损失。
+
+        若启用 RLT，则同时计算 RLT 模块的损失并返回总损失字典；
+        否则直接返回 VLA 损失标量。
+        """
         if hasattr(self, "gradient_checkpointing_disable"):
             self.gradient_checkpointing_disable()
 
@@ -416,6 +460,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         }
 
     def _sft_forward_with_rlt_prefix(self, observation, actions):
+        """带 RLT 前缀的 SFT 前向，同时返回 VLA 损失和前缀嵌入（供 RLT 模块使用）。
+
+        在标准流匹配训练基础上，额外提取 prefix_output 用于 RLT 模块的联合训练。
+        """
         images, img_masks, lang_tokens, lang_masks, state = (
             self._preprocess_observation(observation, train=True)
         )
@@ -484,6 +532,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return loss, prefix_output, prefix_pad_masks
 
     def _build_rlt_prefix_cache(self, observation, *, train: bool):
+        """构建 RLT 前缀缓存：预处理观测并计算 prefix KV cache。"""
         images, img_masks, lang_tokens, lang_masks, state = (
             self._preprocess_observation(observation, train=train)
         )
@@ -504,6 +553,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     def _select_rlt_prefix_embeddings(
         self, prefix_output, prefix_pad_masks, lang_tokens
     ):
+        """根据 rlt_image_only 配置，从 prefix 输出中选取仅图像 token 或全部 token。"""
         if self.config.rlt_image_only and lang_tokens is not None:
             num_image_tokens = prefix_output.shape[1] - lang_tokens.shape[1]
             prefix_output = prefix_output[:, :num_image_tokens]
@@ -511,6 +561,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return prefix_output, prefix_pad_masks
 
     def _extract_rlt_prefix_embeddings(self, observation, *, train: bool):
+        """在无梯度模式下提取 RLT 前缀嵌入。"""
         with torch.no_grad():
             prefix_output, prefix_pad_masks, _, lang_tokens, _ = (
                 self._build_rlt_prefix_cache(observation, train=train)
@@ -521,6 +572,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         )
 
     def _select_configured_state(self, states):
+        """根据 config.state_indices 从状态向量中选取指定维度。
+
+        若 state_indices 为 None 或维度已匹配则原样返回；
+        否则按索引选取子集（支持 torch.Tensor 和 numpy.ndarray）。
+        """
         indices = self.config.state_indices
         if not indices:
             return states
@@ -547,6 +603,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self,
         env_obs: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
+        """从环境观测中提取 RLT 所需的观测表示。
+
+        返回包含 z_rl（RLT 编码）、proprio（本体感觉状态）和 ref_chunk（参考动作块）的字典。
+        """
         if not self.config.use_rlt or not hasattr(self, "rlt_module"):
             raise ValueError("extract_rlt_obs requires openpi.use_rlt=True.")
 
@@ -604,7 +664,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         }
 
     def prepare_dagger_sft_batch(self, batch):
-        """Prepare replay-buffer samples for DAgger SFT updates."""
+        """Prepare replay-buffer samples for DAgger SFT updates.
+
+        将回放缓冲区中的样本转换为 DAgger SFT 训练所需的格式。
+        若 batch 中包含 model_action（模型原始输出），则直接使用；
+        否则使用 action 并经 input_transform 处理。
+        """
         device = next(self.parameters()).device
         obs_dict = {}
         obs_prefix_keys = [k for k in batch.keys() if k.startswith("observation/")]
@@ -710,6 +775,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         forward_inputs: dict[str, torch.Tensor],
         **kwargs,
     ) -> dict[str, Any]:
+        """RL 默认前向：根据采样轨迹 chains 计算日志概率、价值和熵。
+
+        用于 PPO 等 Actor-Critic 算法在训练时重新计算 old_logprobs 对应的 logprob/value。
+        """
         # get kwargs
         compute_values = kwargs.get("compute_values", False)
         chains = forward_inputs["chains"]
@@ -791,6 +860,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return result
 
     def obs_processor(self, env_obs):
+        """将环境观测转换为策略输入观测字典。
+
+        根据 config_name 处理不同环境的状态格式（如 CALVIN 的 ee_pos/rot/gripper 拆分），
+        并组装 observation/image、observation/state 等键。
+        """
         env_states = self._select_configured_state(env_obs["states"])
         processed_obs = {
             "observation/image": env_obs["main_images"],
@@ -810,6 +884,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return processed_obs
 
     def precision_processor(self, processed_obs):
+        """将观测字典中的所有张量移动到模型设备并确保内存连续。"""
         device = next(self.parameters()).device
         for key, value in processed_obs.items():
             if isinstance(value, list):
@@ -835,6 +910,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         compute_values=True,
         **kwargs,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """批量预测动作，返回环境可执行动作和前向计算所需的中间状态。
+
+        DSRL 模式下：SAC 策略先输出噪声 -> 扩散模型用噪声采样动作 -> 返回实际动作。
+        非 DSRL 模式下：直接用扩散模型采样动作。
+        返回的 result 包含 prev_logprobs、prev_values 和 forward_inputs（供后续 default_forward 使用）。
+        """
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
         processed_obs = self.input_transform(
             to_process_obs, transpose=False
@@ -967,6 +1048,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         mode="train",
         compute_values=True,
     ) -> torch.Tensor:
+        """在已有 prefix KV cache 的基础上执行多步去噪采样。
+
+        核心采样循环：逐步执行 sample_mean_var_val -> Euler 步进 -> 收集 chains/log_probs/values。
+        训练模式下根据 joint_logprob 或 NFT 需求决定 denoise_inds 策略；
+        评估模式下使用最后一步去噪结果。
+        """
         bsize = state.shape[0]
         device = state.device
         num_steps = self.config.num_steps
@@ -1073,6 +1160,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return result
 
     def _get_timesteps(self, denoise_steps, device):
+        """生成去噪时间步序列，从 1 线性递减到 1/denoise_steps，末尾补 0。"""
         timesteps = torch.linspace(1, 1 / denoise_steps, denoise_steps, device=device)
         timesteps = torch.cat([timesteps, torch.zeros((1), device=device)])
         return timesteps
@@ -1240,6 +1328,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     # TODO: to check potential nan here
     def get_logprob_norm(self, sample, mu, sigma):
+        """计算高斯对数概率 log p(x|mu, sigma)。
+
+        safe_get_logprob 模式下仅返回 -(x-mu)^2（用于数值稳定性）；
+        否则返回完整的高斯对数概率，并对 sigma=0 处做安全处理。
+        """
         # logprob = log p(x|mu,sigma) = -log(sigma) - 0.5 * log(2 * pi) - 0.5 * ((x - mu) / sigma) ** 2
         if self.config.safe_get_logprob:
             log_prob = -torch.pow((sample - mu), 2)
@@ -1268,6 +1361,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         denoise_inds,
         compute_values=False,
     ):
+        """根据去噪轨迹 chains 重新计算日志概率、价值和熵。
+
+        在 Actor 训练时调用：利用采样阶段保存的 chains 和 denoise_inds，
+        重新走一遍去噪过程以计算当前策略的 logprob/value/entropy。
+        """
         bsize = state.shape[0]
         batch_indices = torch.arange(bsize)
         prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
@@ -1357,6 +1455,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return entropy
 
     def freeze_vlm(self):
+        """冻结 VLM（PaliGemma）参数，仅训练 expert 部分。
+
+        DSRL 模式下额外冻结 gemma_expert 和投影层，仅保留 DSRL 组件可训练。
+        """
         if self.config.train_expert_only:
             # Base freeze: paligemma (SigLIP vision encoder + Gemma)
             self.paligemma_with_expert.paligemma.eval()
@@ -1622,6 +1724,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     def _get_noise_level(
         self, device: torch.device, dtype: torch.dtype, sample_method: str | None = None
     ) -> torch.Tensor:
+        """获取当前噪声强度。
+
+        flow_ode 模式返回 0；若启用噪声退火则按 global_step 线性衰减，
+        否则返回固定 noise_level。
+        """
         method = sample_method or self.config.noise_method
         if method == "flow_ode":
             return torch.zeros((), device=device, dtype=dtype)
@@ -1721,6 +1828,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self,
         mode: str = "max-autotune",
     ):
+        """启用 torch.compile 编译加速。
+
+        分别编译视觉塔、语言模型（禁用 cuda graph 以避免共享 backbone 冲突）、
+        expert 模型（启用 cuda graph + fullgraph）以及对数概率计算函数。
+        """
         if self.torch_compile_enabled:
             return
 
